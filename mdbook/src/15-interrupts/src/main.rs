@@ -4,152 +4,231 @@
 use cortex_m::asm;
 use cortex_m_rt::entry;
 use critical_section_lock_mut::LockMut;
-use embedded_hal::{delay::DelayNs, digital::OutputPin};
+use embedded_hal::delay::DelayNs;
 use panic_rtt_target as _;
-use rtt_target::{rtt_init_print, rprintln};
+use rtt_target::{rprintln, rtt_init_print};
 
 use microbit::{
+    hal::{
+        gpio,
+        pac::{self, interrupt},
+        pwm::{self, Pwm},
+        time::Hertz,
+        timer::{self, Timer},
+    },
     Board,
-    hal::{gpio, timer, pac::{self, interrupt}},
 };
 
-/// Base siren frequency in Hz.
-const BASE_FREQ: u32 = 440;
-/// Max rise in siren frequency in Hz.
-const FREQ_RISE: u32 = 220;
-/// Time for one full cycle in µs.
-const RISE_TIME: u32 = 500_000;
+//
+// ===========================
+// Configurable Siren Parameters
+// ===========================
+//
 
-/// These convenience types make life easier.
-type SpeakerPin = gpio::Pin<gpio::Output<gpio::PushPull>>;
-type SirenTimer = timer::Timer<pac::TIMER0>;
+#[derive(Clone, Copy)]
+struct SirenConfig {
+    base_freq_hz: u32,
+    freq_rise_hz: u32,
+    rise_time_us: u32,
+    control_period_us: u32,
+}
 
-/// The current state of the siren. Updated by the interrupt
-/// handler when running.
+impl Default for SirenConfig {
+    fn default() -> Self {
+        Self {
+            base_freq_hz: 440,
+            freq_rise_hz: 220,
+            rise_time_us: 500_000,
+            control_period_us: 20_000,
+        }
+    }
+}
+
+//
+// ===========================
+// Type Aliases
+// ===========================
+//
+
+type ControlTimer = timer::Timer<pac::TIMER0>;
+type SirenPwm = Pwm<pac::PWM0>;
+
+//
+// ===========================
+// Siren Driver
+// ===========================
+//
+
+/// PWM-driven siren with timer-based envelope control.
+///
+/// Responsibilities:
+/// - PWM peripheral generates the square wave
+/// - Timer interrupt updates pitch envelope
+///
+/// Non-responsibilities:
+/// - GPIO manipulation
+/// - Logging or allocation
+/// - Ownership of unrelated peripherals
+///
+/// Safety & Concurrency:
+/// - All mutable state is protected by `LockMut`
+/// - ISR execution is bounded and non-blocking
 struct Siren {
-    /// The timer being used by the siren.
-    timer: SirenTimer,
-    /// The MB2 speaker pin. Needs to be owned
-    /// here for the interrupt handler.
-    speaker_pin: SpeakerPin,
-    /// Is the speaker pin currently high or low?
-    pin_high: bool,
-    /// Time in µs since the start of the current siren cycle.
-    cur_time: u32,
+    timer: ControlTimer,
+    pwm: SirenPwm,
+    config: SirenConfig,
+
+    /// Elapsed time within the current envelope cycle (µs)
+    cur_time_us: u32,
 }
 
 impl Siren {
-    /// Make a new siren with the given peripherals.
-    fn new(speaker_pin: SpeakerPin, timer: SirenTimer) -> Self {
+    /// Construct a new siren driver.
+    ///
+    /// # Preconditions
+    /// - PWM peripheral must be fully configured
+    /// - TIMER0 interrupt must be mapped to `TIMER0`
+    fn new(timer: ControlTimer, pwm: SirenPwm, config: SirenConfig) -> Self {
         Self {
             timer,
-            speaker_pin,
-            pin_high: false,
-            cur_time: 0,
+            pwm,
+            config,
+            cur_time_us: 0,
         }
     }
 
-    /// Start the siren running.
+    /// Start siren playback.
+    ///
+    /// Safe to call multiple times; restarts envelope.
     fn start(&mut self) {
-        self.speaker_pin.set_low().unwrap();
-        self.pin_high = false;
-        self.cur_time = 0;
+        self.cur_time_us = 0;
+        self.apply_frequency();
         self.timer.enable_interrupt();
-        // The timer interval is in ticks.
-        // The [nrf52833_hal] timer is hard-wired to 1M ticks/sec.
-        self.timer.start(1_000_000 / BASE_FREQ);
+        self.arm_timer();
     }
 
-    /// Stop the siren.
+    /// Stop siren playback.
+    ///
+    /// Leaves PWM disabled and control timer inactive.
     fn stop(&mut self) {
         self.timer.disable_interrupt();
+        self.pwm.disable();
     }
 
-    /// Step the siren to the current speaker state change.
-    /// This is normally called from the timer interrupt.
-    fn step(&mut self) {
-        // Flip the speaker pin.
-        if self.pin_high {
-            self.speaker_pin.set_low().unwrap();
-            self.pin_high = false;
-        } else {
-            self.speaker_pin.set_high().unwrap();
-            self.pin_high = true;
-        }
+    /// Control-loop tick handler.
+    ///
+    /// Called exclusively from the TIMER0 ISR.
+    fn on_control_tick(&mut self) {
+        self.advance_envelope();
+        self.apply_frequency();
+        self.arm_timer();
+    }
 
-        // Figure out the next period. The math is a little
-        // special here.
+    /// Advance envelope time, wrapping cleanly.
+    #[inline(always)]
+    fn advance_envelope(&mut self) {
+        self.cur_time_us =
+            (self.cur_time_us + self.config.control_period_us) % (2 * self.config.rise_time_us);
+    }
 
-        // First, wrap to the next siren cycle if needed.
-        while self.cur_time >= 2 * RISE_TIME {
-            self.cur_time -= 2 * RISE_TIME;
-        }
-        // Next, figure out where we are in the current siren cycle.
-        let cycle_time = if self.cur_time < RISE_TIME {
-            self.cur_time
+    /// Compute and apply the current PWM frequency and duty.
+    ///
+    /// IMPORTANT:
+    /// `set_period()` mutates `max_duty`, so duty must
+    /// always be reapplied afterward.
+    fn apply_frequency(&mut self) {
+        let cycle_time = if self.cur_time_us < self.config.rise_time_us {
+            self.cur_time_us
         } else {
-            2 * RISE_TIME - self.cur_time
+            2 * self.config.rise_time_us - self.cur_time_us
         };
-        // Finally, calculate the frequency and period.
-        let frequency = BASE_FREQ + FREQ_RISE * cycle_time / RISE_TIME;
-        let period = 1_000_000 / frequency;
 
-        // Anticipate the time of the next interrupt.
-        self.cur_time += period / 2;
+        let frequency_hz = self.config.base_freq_hz
+            + (self.config.freq_rise_hz * cycle_time) / self.config.rise_time_us;
 
-        // Make sure to clear the current interrupt before
-        // starting the next one, else you might get interrupted
-        // again immediately.
+        self.pwm.set_period(Hertz(frequency_hz));
+
+        // Maintain 50% duty cycle invariant
+        let duty = self.pwm.max_duty() / 2;
+        self.pwm.set_duty_on_common(duty);
+    }
+
+    /// Arm the control timer for the next tick.
+    #[inline(always)]
+    fn arm_timer(&mut self) {
         self.timer.reset_event();
-        self.timer.start(period / 2);
+        self.timer.start(self.config.control_period_us);
     }
 }
 
-/// The siren. Accessible from both the interrupt handler
-/// and the main program.
+//
+// ===========================
+// Global State
+// ===========================
+//
+
 static SIREN: LockMut<Siren> = LockMut::new();
 
-/// The timer interrupt for the siren. Just steps the siren.
+//
+// ===========================
+// Interrupt Handler
+// ===========================
+//
+
 #[interrupt]
 fn TIMER0() {
-    SIREN.with_lock(|siren| siren.step());
+    SIREN.with_lock(|siren| siren.on_control_tick());
 }
+
+//
+// ===========================
+// Entry Point
+// ===========================
+//
 
 #[entry]
 fn main() -> ! {
     rtt_init_print!();
     let board = Board::take().unwrap();
-    // It is convenient to use a `degrade()`ed pin
-    // to avoid having to deal with the type of the
-    // speaker pin, rather than looking it up:
-    // the pin is stored globally in `SIREN`, so its
-    // size must be known.
-    //
-    // This does lose type safety, but that is unlikely
-    // to matter after this point.
-    let speaker_pin = board.speaker_pin
+
+    // Speaker GPIO
+    let speaker_pin = board
+        .speaker_pin
         .into_push_pull_output(gpio::Level::Low)
         .degrade();
-    let timer0 = timer::Timer::new(board.TIMER0);
-    let mut timer1 = timer::Timer::new(board.TIMER1);
 
-    // Set up the NVIC to handle interrupts.
+    let control_timer = Timer::new(board.TIMER0);
+    let mut delay_timer = Timer::new(board.TIMER1);
+
+    // PWM configuration (done once, before handing off)
+    let pwm = {
+        let pwm = Pwm::new(board.PWM0);
+        pwm.set_output_pin(pwm::Channel::C0, speaker_pin)
+            .set_prescaler(pwm::Prescaler::Div1);
+        pwm.enable();
+        pwm
+    };
+
+    // Enable TIMER0 interrupt
+    //
+    // SAFETY:
+    // - ISR is defined
+    // - Global siren initialized before use
     unsafe { pac::NVIC::unmask(pac::Interrupt::TIMER0) };
     pac::NVIC::unpend(pac::Interrupt::TIMER0);
 
-    // Place the siren struct where the interrupt handler can find it.
-    let siren = Siren::new(speaker_pin, timer0);
-    SIREN.init(siren);
+    // Initialize global siren
+    SIREN.init(Siren::new(control_timer, pwm, SirenConfig::default()));
 
-    // Start the siren and do the countdown.
-    SIREN.with_lock(|siren| siren.start());
+    // Demonstration countdown
+    SIREN.with_lock(|s| s.start());
     for t in (1..=10).rev() {
         rprintln!("{}", t);
-        timer1.delay_ms(1_000);
+        delay_timer.delay_ms(1_000);
     }
     rprintln!("launch!");
-    SIREN.with_lock(|siren| siren.stop());
-    
+    SIREN.with_lock(|s| s.stop());
+
     loop {
         asm::wfi();
     }
